@@ -1,0 +1,11 @@
+## IDF Component Manager Manifest File
+dependencies:
+  espressif/esp-modbus: "==2.1.0"
+  espressif/esp_lcd_touch_gt911: "==1.1.3"
+  espressif/esp_lvgl_port: "==2.6.0"
+  lvgl/lvgl:
+    path: ../components/lvgl__lvgl
+
+  ## Required IDF version
+ 
+  

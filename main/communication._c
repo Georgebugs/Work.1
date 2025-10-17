@@ -1,0 +1,223 @@
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include "driver/uart.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "esp_modbus_common.h"
+#include "esp_modbus_master.h"
+#include "communication.h"
+#include "freertos/idf_additions.h"
+#include "freertos/projdefs.h"
+#include "portmacro.h"
+
+static const char* TAG = "MB-CM";
+#define cCOMM_TASK_STACK_SIZE (8192)
+static TaskHandle_t xCommTaskHandle = NULL;
+static StackType_t xCommStack[cCOMM_TASK_STACK_SIZE];
+static StaticTask_t xCommTaskdef;
+static EventGroupHandle_t xEventGroupHandle = NULL;
+static StaticEventGroup_t xEventGroupBuffer;
+
+#pragma pack(push, 1)
+typedef struct
+{
+    uint16_t usCommandCode;
+    uint16_t usParamA;
+    uint16_t usParamB;
+    uint16_t usID;
+} tCommandStruct;
+#pragma pack(pop)
+
+static uint16_t usCurrentCommandID = 0;
+
+#define cCOMMAND_QUEUE_LENGTH (10)
+static StaticQueue_t xCommandQueue;
+static uint8_t ucCommandQueueStorageArea[cCOMMAND_QUEUE_LENGTH * sizeof(tCommandStruct)];
+static QueueHandle_t xCommandQueueHandle = NULL;
+
+spinlock_t xLockMutex = portMUX_INITIALIZER_UNLOCKED;
+
+#define MB_PORT_NUM (UART_NUM_1)
+#define MB_DEV_SPEED (115200)
+#define MASTER_MAX_RETRY (30)
+#define UPDATE_CIDS_TIMEOUT_MS (500)
+#define POLL_TIMEOUT_MS (3)
+#define cPOLL_PERIOD_MS (10)
+
+#define MB_DEVICE_ADDR1 (1)
+
+uRegisterPollMap xRegisters = { 0 };
+uint16_t pusRegularPollDataShadowCopy[cPOLLING_SIZE_WORDS] = { UINT16_MAX };
+
+uint16_t usCommandRegPool[sizeof(tCommandStruct) / sizeof(uint16_t)] = { 0};
+
+
+typedef enum
+{
+    cidPollData = 0,
+    cidCommand = 1,
+    cid_MAX = 2
+} tCIDs;
+
+#define HOLD_OFFSET(field) ((uint16_t)(offsetof(holding_reg_params_t, field) + 1))
+#define TEST_HOLD_REG_START(field) (HOLD_OFFSET(field) >> 1)
+
+void* master_handler = NULL;
+
+static const mb_parameter_descriptor_t device_parameters[cid_MAX] = {
+{
+	.cid = cidPollData,
+	.param_key = "PollData",
+	.param_units = "",
+	.mb_slave_addr = MB_DEVICE_ADDR1,
+	.mb_param_type = MB_PARAM_HOLDING,
+	.mb_reg_start = eFirstDataAddressForPolling,
+	.mb_size = cPOLLING_SIZE_WORDS,
+	.param_offset = (uint32_t) &(xRegisters.usRegisters[0]),
+	.param_type = PARAM_TYPE_U16,
+	.param_size = (cPOLLING_SIZE_WORDS) * sizeof(uint16_t),
+	.param_opts = { .min = 0, .max = 65535, .step = 1 },
+	.access = PAR_PERMS_READ_WRITE
+},
+{
+	.cid = cidCommand,
+	.param_key = "Command",
+	.param_units = "",
+	.mb_slave_addr = MB_DEVICE_ADDR1,
+	.mb_param_type = MB_PARAM_HOLDING,
+	.mb_reg_start = 0x0000,
+	.mb_size = eCommandLength,
+	.param_offset = (uint32_t) & (usCommandRegPool[0]),
+	.param_type = PARAM_TYPE_U16,
+	.param_size = sizeof(usCommandRegPool) * sizeof(uint16_t),
+	.param_opts = { .min = 0, .max = 65535, .step = 1 },
+	.access = PAR_PERMS_WRITE
+},
+};
+
+void vCommTask(void* pvParam)
+{
+    const mb_communication_info_t xComm = { .ser_opts = { .port = MB_PORT_NUM, .mode = MB_RTU, .baudrate = MB_DEV_SPEED, .parity = MB_PARITY_NONE, .response_tout_ms = 2 + (1000000 / MB_DEV_SPEED) } };
+    ESP_LOGI(TAG, "Starting communication task...");    
+
+    esp_err_t err = mbc_master_create_serial((void*)&xComm, &master_handler);
+    ESP_ERROR_CHECK(master_handler == NULL);
+    ESP_ERROR_CHECK(err != ESP_OK);
+    err = uart_set_pin(MB_PORT_NUM, GPIO_NUM_16, GPIO_NUM_15, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    ESP_ERROR_CHECK(err != ESP_OK);
+	err = uart_set_mode(MB_PORT_NUM, UART_MODE_RS485_HALF_DUPLEX);
+	ESP_ERROR_CHECK(err != ESP_OK);
+	err = mbc_master_set_descriptor(master_handler, &device_parameters[0], cid_MAX);
+	ESP_ERROR_CHECK(err != ESP_OK);
+    err = mbc_master_start(master_handler);
+    ESP_ERROR_CHECK(err != ESP_OK);        
+
+    ESP_LOGI(TAG, "Modbus master stack initialized...");	
+
+    TickType_t xTimeToWait = pdMS_TO_TICKS(cPOLL_PERIOD_MS);
+	uint32_t ulErrorCounter = 0;
+	
+    while(1)
+    {
+        tCommandStruct xNewCommand = { .usCommandCode = 0 };
+
+        if(pdTRUE == xQueuePeek(xCommandQueueHandle, &xNewCommand, xTimeToWait))
+        {
+            taskENTER_CRITICAL(&xLockMutex);
+	        usCommandRegPool[eCommandCode] = xNewCommand.usCommandCode;
+	        usCommandRegPool[eCommandParamA] = xNewCommand.usParamA;
+	        usCommandRegPool[eCommandParamB] = xNewCommand.usParamB;
+	        usCommandRegPool[eCommandID] = xNewCommand.usID;
+            taskEXIT_CRITICAL(&xLockMutex);
+
+            uint8_t ucType = 0;
+	        err = mbc_master_set_parameter(master_handler, cidCommand, (uint8_t*)&(usCommandRegPool[0]), &ucType);
+
+	        if (ESP_OK == err)
+	        {
+		        ulErrorCounter = 0;
+		        xQueueReceive(xCommandQueueHandle, &xNewCommand, 0);
+		        ESP_LOGI(TAG, "Set success!");
+	        }	        
+	        else
+	        {
+		        if (++ulErrorCounter > 10)
+		        {
+			        ulErrorCounter = 0;
+			        xQueueReceive(xCommandQueueHandle, &xNewCommand, 0);
+			        ESP_LOGE(TAG, "Can't transmit data. Dropped!");
+		        }
+	        }
+        }
+        else
+        {
+            uint8_t ucType = 0;
+	        volatile esp_err_t err;
+	        err = mbc_master_get_parameter(master_handler, cidPollData, (uint8_t*)&(pusRegularPollDataShadowCopy[0]), &ucType);
+
+            if(err == ESP_OK)
+            {
+                taskENTER_CRITICAL(&xLockMutex);
+	            if (0 != memcmp(&(xRegisters.usRegisters), pusRegularPollDataShadowCopy, sizeof(pusRegularPollDataShadowCopy)))
+                {
+	                memcpy(&(xRegisters.usRegisters), &pusRegularPollDataShadowCopy, sizeof(pusRegularPollDataShadowCopy));
+                    xEventGroupSetBits(xEventGroupHandle, eNewData);
+                }
+                taskEXIT_CRITICAL(&xLockMutex);
+
+                xTimeToWait = pdMS_TO_TICKS(cPOLL_PERIOD_MS);
+            }
+            else
+            {
+                xTimeToWait = pdMS_TO_TICKS(1);
+            }
+        }
+    }
+}
+
+esp_err_t eCommunicationSendCommand(const uint16_t usCommand, const uint16_t usParamA, const uint16_t usParamB)
+{
+    taskENTER_CRITICAL(&xLockMutex);
+    usCurrentCommandID++;
+    tCommandStruct xTempCommand = { .usID = usCurrentCommandID };
+    taskEXIT_CRITICAL(&xLockMutex);
+
+    xTempCommand.usCommandCode = usCommand;
+	xTempCommand.usParamA = usParamA;
+	xTempCommand.usParamB = usParamB;
+
+    if(pdTRUE == xQueueSend(xCommandQueueHandle, &xTempCommand, 0))
+        return ESP_OK;
+
+    return ESP_FAIL;
+}
+
+esp_err_t eCommunicationInit(const UBaseType_t uxCommTaskPriority)
+{
+    xCommandQueueHandle = xQueueCreateStatic(cCOMMAND_QUEUE_LENGTH, sizeof(tCommandStruct), ucCommandQueueStorageArea, &xCommandQueue);
+    ESP_ERROR_CHECK(NULL == xCommandQueueHandle);
+    xCommTaskHandle = xTaskCreateStatic(&vCommTask, TAG, cCOMM_TASK_STACK_SIZE, NULL, uxCommTaskPriority, xCommStack, &xCommTaskdef);
+    ESP_ERROR_CHECK(NULL == xCommTaskHandle);
+    xEventGroupHandle = xEventGroupCreateStatic(&xEventGroupBuffer);
+    ESP_ERROR_CHECK(NULL == xEventGroupHandle);
+
+    return ESP_OK;
+}
+
+EventGroupHandle_t xCommunicationGetEvenGroupHandle(void)
+{
+	return xEventGroupHandle;		
+}
+
+uint16_t usCommunicationGetRegister(const uint16_t usAddress)
+{
+	return xRegisters.usRegisters[usAddress]; 
+}
+
+const tLogicMap* xpCommunicationGetLogicMapCpointer(void)
+{
+	return &(xRegisters.xLogicMap);		
+}

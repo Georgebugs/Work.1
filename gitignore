@@ -1,0 +1,26 @@
+# === ESP-IDF build files ===
+build/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+
+# === IDE and editor files ===
+.vscode/
+.idea/
+.settings/
+.cproject
+.project
+
+# === LVGL and assets ===
+*.bin
+*.elf
+*.map
+*.log
+
+# === System files ===
+.DS_Store
+Thumbs.db
+
+# === Backup or temporary ===
+*.tmp
+*.bak

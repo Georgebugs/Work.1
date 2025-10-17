@@ -1,0 +1,40 @@
+# === ESP-IDF build files ===
+build/
+*.bin
+*.elf
+*.map
+*.dump
+*.hex
+
+# === SDK and configuration ===
+sdkconfig
+sdkconfig.old
+
+# === VSCode / IDE ===
+.vscode/
+.idea/
+*.code-workspace
+
+# === Logs and temp ===
+*.log
+*.tmp
+*.bak
+*.swp
+
+# === Python virtual env / tools ===
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# === CMake / Ninja ===
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+*.cmake
+ninja.build
+
+# === Local files ===
+local_config/
+secrets/
